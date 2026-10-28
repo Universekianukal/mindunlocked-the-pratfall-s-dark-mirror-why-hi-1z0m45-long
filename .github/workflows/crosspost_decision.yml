@@ -1,0 +1,96 @@
+name: Crosspost Decision
+
+# Dispatched by the mindunlocked-bot Worker whenever a Facebook/Instagram
+# Approve/Reject button is tapped in Telegram (see fbIgDecisionKeyboard /
+# dispatchCrosspostDecision in worker.js). Lives here (not in a per-video
+# build repo, which self-deletes right after upload) because this is the one
+# template repo that's permanent -- the workflow itself is format-agnostic,
+# it posts whatever video_url/caption it's given regardless of whether the
+# original video was long or short.
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        required: true
+      platform:
+        description: "fb or ig"
+        required: true
+      decision:
+        description: "approve or reject"
+        required: true
+      video_url:
+        description: "permanent Cloudinary link"
+        required: false
+      caption:
+        required: false
+      notify_chat_id:
+        required: false
+      # Reels options, ported from shadow_gasp 2026-09-18. All blank by
+      # default, so an ordinary Approve dispatches exactly as it always did.
+      schedule_at:
+        description: "fb only: unix seconds -> Facebook's own scheduler (shows in the FB Planner). Blank = post now"
+        required: false
+        default: ""
+      ig_reels_only:
+        description: "ig only: 'true' = Reels tab only (share_to_feed=false, not in the profile grid). Blank = Reel + grid"
+        required: false
+        default: ""
+      fb_as_reel:
+        description: "fb only: 'true' = publish as a Facebook REEL (Reels Publishing API, 3-90 s). Blank = normal video"
+        required: false
+        default: ""
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python deps
+        run: pip install --quiet requests
+      - name: Post or skip
+        env:
+          MU_VIDEO_ID: ${{ inputs.video_id }}
+          PLATFORM: ${{ inputs.platform }}
+          DECISION: ${{ inputs.decision }}
+          VIDEO_URL: ${{ inputs.video_url }}
+          CAPTION: ${{ inputs.caption }}
+          NOTIFY_CHAT_ID: ${{ inputs.notify_chat_id }}
+          SCHEDULE_AT: ${{ inputs.schedule_at }}
+          IG_REELS_ONLY: ${{ inputs.ig_reels_only }}
+          FB_AS_REEL: ${{ inputs.fb_as_reel }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          CLIP_LEDGER_SECRET: ${{ secrets.CLIP_LEDGER_SECRET }}
+        run: python3 _fb_ig_post_decision.py
+
+      # ---- failure alert (added 2026-09-19) ----
+      # Until now this workflow had NO failure branch: a bad token, an
+      # Instagram refusal or a network blip left the run red in a tab nobody
+      # opens and said nothing in Telegram. That was survivable while every
+      # post came from a button tap someone was watching; it is not, now the
+      # autopilot dispatches this unattended every day.
+      #
+      # Purely additive -- runs only on failure, so every successful path is
+      # byte-for-byte what it was.
+      - name: Tell Telegram this post FAILED
+        if: failure()
+        continue-on-error: true
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VIDEO_ID: ${{ inputs.video_id }}
+          PLATFORM: ${{ inputs.platform }}
+          DECISION: ${{ inputs.decision }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # One line, and built in python, so a title or error text carrying a
+          # quote cannot break the payload.
+          T="🔴 MindUnlocked ${PLATFORM} post FAILED for video ${VIDEO_ID} (${DECISION}). Nothing was posted, and it was never marked posted — so it stays in the queue and the autopilot will try it again tomorrow. Log: ${RUN_URL}" \
+            python3 -c 'import json,os;print(json.dumps({"chat_id":os.environ["CHAT"],"text":os.environ["T"]}))' > tgfail.json
+          # Check Telegram's own ok flag: curl -sS exits 0 on a 403/400 too, so
+          # discarding the reply would turn a lost alert into a green step.
+          curl -sS -X POST "https://api.telegram.org/bot$BOT/sendMessage" \
+            -H "Content-Type: application/json" --data @tgfail.json -o tgfail_resp.json \
+            || echo "WARNING: could not reach Telegram"
+          python3 -c 'import json;d=json.load(open("tgfail_resp.json"));print("alert delivered, message_id",d["result"]["message_id"]) if d.get("ok") else print("WARNING: telegram refused the alert:",d)' \
+            2>/dev/null || echo "WARNING: unreadable Telegram response"

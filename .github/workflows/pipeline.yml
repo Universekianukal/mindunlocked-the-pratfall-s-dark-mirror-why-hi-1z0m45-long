@@ -1,0 +1,492 @@
+name: Pipeline (build + render)
+
+# Full cloud pipeline: TTS -> Pexels fetch -> transcribe -> captions -> timeline ->
+# chunk compositions -> parallel render -> stitch. Zero local execution required.
+# Generalized across long-form (canvas.json chunks>1) and short-form (chunks=1).
+
+on:
+  workflow_dispatch:
+    inputs:
+      # "high" quality drives a near-lossless x264 encode slow enough (~4fps)
+      # that heavier chunks blow past the render tool's internal encode
+      # timeout and get SIGTERM'd. "standard" is fast enough and stitch
+      # re-encodes at CRF 18 anyway, so intra-chunk quality doesn't matter.
+      quality:
+        description: "draft | standard | high"
+        default: "standard"
+      chunk_index:
+        description: "Render only this chunk index (blank = all chunks)"
+        default: ""
+      upload:
+        description: "Upload final video to YouTube after stitch"
+        type: boolean
+        default: true
+      topic:
+        description: "Video topic (only used if vo.txt isn't already committed)"
+        default: ""
+      regen_thumbnail:
+        description: "Skip the full build; only regenerate the thumbnail (used by the Telegram Regenerate button)"
+        type: boolean
+        default: false
+      thumb_token:
+        description: "Worker-minted token identifying the Telegram Regenerate button that triggered this run, if any"
+        default: ""
+      hook_feedback:
+        description: "Retention-agent feedback on recent hooks, injected into the script prompt (blank = none)"
+        default: ""
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    if: ${{ github.event.inputs.regen_thumbnail != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      chunk_list: ${{ steps.chunks.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+
+      - name: FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Python deps (proven scripts, not the CLI wrapper)
+        # av<19: PyAV 19.0 (2026-09-29) removed av.open(metadata_errors=...), which
+        # faster-whisper still passes -- every build died in _transcribe.py with
+        # "TypeError: open() got an unexpected keyword argument 'metadata_errors'".
+        run: pip install --quiet kokoro-onnx soundfile numpy faster-whisper "av<19" anthropic
+
+      - name: Generate script + beats + metadata from topic (skipped if vo.txt already committed)
+        env:
+          # LLM_PROVIDER default 'fireworks' while Anthropic credits are out.
+          # To switch back after topping up: set the repo/org Actions variable
+          # LLM_PROVIDER=anthropic (no code change), or clear it and rely on
+          # auto (Anthropic wins whenever ANTHROPIC_API_KEY is present).
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'featherless' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          FEATHERLESS_API_KEY: ${{ secrets.FEATHERLESS_API_KEY }}
+          TOPIC: ${{ github.event.inputs.topic }}
+          HOOK_FEEDBACK: ${{ github.event.inputs.hook_feedback }}
+        run: python3 _gen_video_content.py
+
+      - name: Cache media models (TTS + whisper)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hyperframes
+          key: hyperframes-media-cache-v1-${{ runner.os }}
+
+      - name: TTS (skip if vo.wav already committed)
+        run: |
+          if [ ! -f assets/vo.wav ]; then
+            mkdir -p ~/.cache/hyperframes/tts/models ~/.cache/hyperframes/tts/voices
+            [ -f ~/.cache/hyperframes/tts/models/kokoro-v1.0.onnx ] || curl -sL -o ~/.cache/hyperframes/tts/models/kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+            [ -f ~/.cache/hyperframes/tts/voices/voices-v1.0.bin ] || curl -sL -o ~/.cache/hyperframes/tts/voices/voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+            python3 _tts.py
+          else
+            echo "assets/vo.wav already present, skipping TTS"
+          fi
+
+      - name: Fetch Pexels clips
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          CLIP_LEDGER_SECRET: ${{ secrets.CLIP_LEDGER_SECRET }}
+        run: python3 _pexels.py
+
+      - name: Transcribe
+        run: |
+          python3 _transcribe.py
+          test -f transcript.json || { echo "transcript.json not produced"; exit 1; }
+
+      - name: Captions
+        run: python3 _captions.py
+
+      - name: Timeline
+        run: python3 _mk_timeline.py
+
+      - name: Chunk compositions
+        run: python3 _gen_chunks.py 8
+
+      - name: Prepare audio (vo -> m4a, loop music bed to length)
+        run: |
+          COMP=$(python3 -c "import json; print(json.load(open('_timeline.json'))['comp'])")
+          ffmpeg -y -loglevel error -i assets/vo.wav -c:a aac -b:a 192k assets/vo.m4a
+          if [ -f assets/music.mp3 ]; then
+            ffmpeg -y -loglevel error -stream_loop -1 -i assets/music.mp3 -t "$COMP" -c:a aac -b:a 160k assets/music.m4a
+          fi
+
+      - name: Chunk count for render matrix
+        id: chunks
+        run: |
+          ONLY="${{ github.event.inputs.chunk_index }}"
+          if [ -n "$ONLY" ]; then
+            LIST="[$ONLY]"
+          else
+            N=$(ls chunk*.html | wc -l)
+            LIST=$(python3 -c "print([i for i in range($N)])")
+          fi
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+          echo "chunks: $LIST"
+
+      - name: Generate YouTube metadata (title/description/tags from vo.txt)
+        env:
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'featherless' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          FEATHERLESS_API_KEY: ${{ secrets.FEATHERLESS_API_KEY }}
+        run: python3 _gen_youtube_meta.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: youtube-meta
+          path: |
+            youtube.json
+            thumbnail_spec.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            chunk*.html
+            assets/clips/**
+            assets/vo.m4a
+            assets/music.m4a
+            canvas.json
+            _timeline.json
+            _chunks.json
+          retention-days: 3
+          if-no-files-found: error
+
+  render-chunk:
+    needs: build
+    strategy:
+      fail-fast: false
+      # All matrix jobs pull the same multi-GB build-output blob; downloading
+      # it from too many jobs at once makes GitHub's artifact backend return
+      # silently-truncated downloads (step still reports success). Capping
+      # concurrency keeps each download reliable.
+      max-parallel: 2
+      matrix:
+        chunk: ${{ fromJson(needs.build.outputs.chunk_list) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: build-output }
+
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android "$AGENT_TOOLSDIRECTORY" || true
+      - name: Chrome sandbox (Ubuntu 24)
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns || true
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: FFmpeg + font
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -qq ffmpeg fonts-montserrat
+      - name: Cache HyperFrames
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hyperframes
+          key: hyperframes-cache-v1-${{ runner.os }}
+      - name: Install chrome-headless-shell
+        run: |
+          out=$(npx --yes @puppeteer/browsers install chrome-headless-shell@131.0.6778.85 --path "$HOME/.cache/hyperframes/puppeteer")
+          echo "$out"
+          p=$(echo "$out" | tail -1 | cut -d' ' -f2-)
+          test -x "$p" || { echo "chrome-headless-shell not executable: $p"; exit 1; }
+          echo "HYPERFRAMES_BROWSER_PATH=$p" >> "$GITHUB_ENV"
+      - name: Render chunk ${{ matrix.chunk }}
+        run: |
+          mkdir -p renders
+          # hyperframes render always requires an index.html at project root as a
+          # validity check, even when -c points elsewhere. chunk0.html satisfies it.
+          cp chunk0.html index.html
+          npx --yes hyperframes@0.6.80 render -c chunk${{ matrix.chunk }}.html \
+            --fps 30 \
+            --output renders/chunk${{ matrix.chunk }}.mp4 \
+            --workers 1 --low-memory-mode \
+            --quality "${{ github.event.inputs.quality || 'high' }}" \
+            --browser-timeout 300 --protocol-timeout 900000 --player-ready-timeout 180000
+      - name: Sanity (frames differ)
+        run: |
+          ffmpeg -y -loglevel error -i renders/chunk${{ matrix.chunk }}.mp4 -frames:v 1 /tmp/a.png
+          ffmpeg -y -loglevel error -ss 1 -i renders/chunk${{ matrix.chunk }}.mp4 -frames:v 1 /tmp/b.png
+          [ "$(md5sum /tmp/a.png | cut -d' ' -f1)" != "$(md5sum /tmp/b.png | cut -d' ' -f1)" ] || { echo "identical frames"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk }}
+          path: renders/chunk${{ matrix.chunk }}.mp4
+          retention-days: 7
+          if-no-files-found: error
+
+  stitch:
+    needs: render-chunk
+    if: ${{ github.event.inputs.chunk_index == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: build-output }
+      - name: FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -qq ffmpeg
+      - name: Download chunk videos
+        uses: actions/download-artifact@v4
+        with:
+          path: chunks
+          pattern: chunk-*
+          merge-multiple: true
+      - name: Concatenate + mux audio
+        run: |
+          mkdir -p renders
+          # ffmpeg's concat demuxer resolves relative paths against the list
+          # file's own directory (chunks/), so entries must be bare filenames.
+          ls chunks/*.mp4 | sort -V | xargs -n1 basename | sed "s/^/file '/;s/$/'/" > chunks/list.txt
+          cat chunks/list.txt
+          N=$(wc -l < chunks/list.txt)
+          MUSIC_ARG=""; MUSIC_FILTER=""
+          if [ -f assets/music.m4a ]; then MUSIC_ARG="-i assets/music.m4a"; fi
+          if [ "$N" = "1" ]; then
+            if [ -n "$MUSIC_ARG" ]; then
+              ffmpeg -y -loglevel error -i "chunks/$(cat chunks/list.txt | sed "s/^file '//;s/'$//")" -i assets/vo.m4a -i assets/music.m4a \
+                -filter_complex "[1:a]volume=1[a0];[2:a]volume=0.16[a1];[a0][a1]amix=inputs=2:normalize=0:duration=first[a]" \
+                -map 0:v -map "[a]" -c:v libx264 -profile:v high -crf 18 -pix_fmt yuv420p -r 30 \
+                -c:a aac -b:a 160k -movflags +faststart renders/final.mp4
+            else
+              ffmpeg -y -loglevel error -i "chunks/$(cat chunks/list.txt | sed "s/^file '//;s/'$//")" -i assets/vo.m4a \
+                -map 0:v -map 1:a -c:v libx264 -profile:v high -crf 18 -pix_fmt yuv420p -r 30 \
+                -c:a aac -b:a 160k -movflags +faststart renders/final.mp4
+            fi
+          else
+            ffmpeg -y -loglevel error -f concat -safe 0 -i chunks/list.txt -c copy renders/_concat.mp4
+            if [ -n "$MUSIC_ARG" ]; then
+              ffmpeg -y -loglevel error -i renders/_concat.mp4 -i assets/vo.m4a -i assets/music.m4a \
+                -filter_complex "[1:a]volume=1[a0];[2:a]volume=0.16[a1];[a0][a1]amix=inputs=2:normalize=0:duration=first[a]" \
+                -map 0:v -map "[a]" -c:v libx264 -profile:v high -crf 18 -pix_fmt yuv420p -r 30 \
+                -c:a aac -b:a 160k -movflags +faststart renders/final.mp4
+            else
+              ffmpeg -y -loglevel error -i renders/_concat.mp4 -i assets/vo.m4a \
+                -map 0:v -map 1:a -c:v libx264 -profile:v high -crf 18 -pix_fmt yuv420p -r 30 \
+                -c:a aac -b:a 160k -movflags +faststart renders/final.mp4
+            fi
+          fi
+      - name: Verify final
+        run: |
+          ffprobe -v error -show_entries format=duration:format=size -of default=nw=1 renders/final.mp4
+          ffmpeg -y -loglevel error -i renders/final.mp4 -frames:v 1 /tmp/f0.png
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 renders/final.mp4)
+          SS=$(python3 -c "print(max(1,float('$DUR')/2))")
+          ffmpeg -y -loglevel error -ss "$SS" -i renders/final.mp4 -frames:v 1 /tmp/f1.png
+          [ "$(md5sum /tmp/f0.png|cut -d' ' -f1)" != "$(md5sum /tmp/f1.png|cut -d' ' -f1)" ] || { echo "identical"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: renders/final.mp4
+          retention-days: 30
+          if-no-files-found: error
+      - name: Delete intermediate artifacts (build-output, chunk-*) now that final-video exists
+        # 2026-07-03 incident: retry attempts across a few days left 9 duplicate
+        # 1.6GB build-output blobs on one repo alone, silently eating the whole
+        # account's Actions storage quota until every video's upload step
+        # started failing with "storage quota has been hit" -- and that quota
+        # check is cached for 6-12h, so it doesn't self-heal quickly even after
+        # cleanup. Deleting the now-unneeded intermediates as soon as
+        # final-video exists prevents this from recurring.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for name in build-output chunk-0 chunk-1 chunk-2 chunk-3 chunk-4 chunk-5; do
+            id=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" --jq ".artifacts[] | select(.name==\"$name\" and .workflow_run.id==${{ github.run_id }}) | .id" 2>/dev/null | head -1)
+            if [ -n "$id" ]; then
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" 2>/dev/null && echo "deleted $name ($id)" || echo "failed to delete $name ($id)"
+            fi
+          done
+
+  thumbnail:
+    needs: build
+    if: always() && needs.build.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Download YouTube metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: youtube-meta
+      - name: FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Chrome sandbox (Ubuntu 24)
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns || true
+      - name: Install chrome-headless-shell
+        run: |
+          out=$(npx --yes @puppeteer/browsers install chrome-headless-shell@131.0.6778.85 --path "$HOME/.cache/hyperframes/puppeteer")
+          echo "$out"
+          p=$(echo "$out" | tail -1 | cut -d' ' -f2-)
+          test -x "$p" || { echo "chrome-headless-shell not executable: $p"; exit 1; }
+          echo "CHROME_BIN=$p" >> "$GITHUB_ENV"
+      - name: Python deps
+        run: pip install --quiet anthropic kaggle==2.2.2
+      - name: Kaggle auth
+        run: |
+          mkdir -p ~/.kaggle
+          printf '%s' "${{ secrets.KAGGLE_ACCESS_TOKEN }}" > ~/.kaggle/access_token
+          chmod 600 ~/.kaggle/access_token
+      - name: Generate thumbnail (best-effort, never fails the pipeline)
+        env:
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'featherless' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          FEATHERLESS_API_KEY: ${{ secrets.FEATHERLESS_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TOPIC: ${{ github.event.inputs.topic }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THUMB_TOKEN: ${{ github.event.inputs.thumb_token }}
+        run: python3 _gen_thumbnail.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thumbnail
+          path: thumbnail.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Standalone path for the Telegram "Regenerate" button: skips build/render
+  # entirely (gated by the job-level `if`s above), just makes a fresh
+  # thumbnail and commits it to the repo. `upload` does its own checkout
+  # later and picks up whatever's on the branch HEAD at that point, so a
+  # regen that lands before `upload` actually runs is used automatically --
+  # no need to wire this job into upload's `needs`, they're separate runs.
+  thumbnail-regen:
+    if: ${{ github.event.inputs.regen_thumbnail == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Chrome sandbox (Ubuntu 24)
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns || true
+      - name: Install chrome-headless-shell
+        run: |
+          out=$(npx --yes @puppeteer/browsers install chrome-headless-shell@131.0.6778.85 --path "$HOME/.cache/hyperframes/puppeteer")
+          echo "$out"
+          p=$(echo "$out" | tail -1 | cut -d' ' -f2-)
+          test -x "$p" || { echo "chrome-headless-shell not executable: $p"; exit 1; }
+          echo "CHROME_BIN=$p" >> "$GITHUB_ENV"
+      - name: Python deps
+        run: pip install --quiet anthropic kaggle==2.2.2
+      - name: Kaggle auth
+        run: |
+          mkdir -p ~/.kaggle
+          printf '%s' "${{ secrets.KAGGLE_ACCESS_TOKEN }}" > ~/.kaggle/access_token
+          chmod 600 ~/.kaggle/access_token
+      - name: Regenerate thumbnail
+        env:
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'featherless' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          FEATHERLESS_API_KEY: ${{ secrets.FEATHERLESS_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TOPIC: ${{ github.event.inputs.topic }}
+          REGEN_THUMBNAIL: "true"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THUMB_TOKEN: ${{ github.event.inputs.thumb_token }}
+        run: python3 _gen_thumbnail.py
+      - name: Commit regenerated thumbnail (best-effort)
+        run: |
+          if [ -f thumbnail.png ]; then
+            git config user.name "kiAnukal"
+            git config user.email "kiAnukal@users.noreply.github.com"
+            git add -f thumbnail.png
+            git commit -m "regenerate thumbnail" || echo "nothing to commit"
+            git push || echo "push failed, leaving thumbnail.png uncommitted"
+          else
+            echo "no thumbnail.png produced, nothing to commit"
+          fi
+
+  upload:
+    needs: [stitch, thumbnail]
+    if: ${{ always() && needs.stitch.result == 'success' && github.event.inputs.upload == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Python deps
+        run: pip install --quiet google-api-python-client google-auth-oauthlib requests cloudinary
+      - name: Download final video
+        uses: actions/download-artifact@v4
+        with:
+          name: final-video
+          path: renders
+      - name: Download YouTube metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: youtube-meta
+      - name: Download thumbnail (best-effort -- may not exist)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: thumbnail
+          path: _artifact_thumb
+      - name: Prefer a regenerated (git-committed) thumbnail over the artifact one
+        # checkout above already pulled thumbnail.png if a "Regenerate" button
+        # tap committed one to the repo after this run started -- that's the
+        # user's most recent choice, so it wins over the original artifact.
+        run: |
+          if [ -f thumbnail.png ]; then
+            echo "using git-committed (regenerated) thumbnail.png"
+          elif [ -f _artifact_thumb/thumbnail.png ]; then
+            cp _artifact_thumb/thumbnail.png thumbnail.png
+            echo "using artifact thumbnail.png"
+          else
+            echo "no thumbnail available from either source"
+          fi
+      - name: Upload to YouTube
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          CLIP_LEDGER_SECRET: ${{ secrets.CLIP_LEDGER_SECRET }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          VIDEO_FORMAT: long
+        run: python3 _youtube_upload.py
+
+      - name: Delete this repo now that the video is safely uploaded (storage-quota prevention)
+        # Complete fix for the recurring Actions storage-quota outage: instead of
+        # cleaning up leftover artifacts after the fact, delete the whole single-use
+        # video repo once its content is safely on YouTube -- no repo left, no
+        # artifacts to accumulate. The Worker's /repo/delete endpoint only allows
+        # repos it itself generated (KV allowlist set at generation time), so this
+        # is a safe no-op for template/persistent repos even though they share this
+        # same workflow file.
+        if: success()
+        continue-on-error: true
+        env:
+          CLIP_LEDGER_SECRET: ${{ secrets.CLIP_LEDGER_SECRET }}
+        run: |
+          REPO="${GITHUB_REPOSITORY#*/}"
+          curl -s -X POST https://mindunlocked-bot.everydayhypehq.workers.dev/repo/delete \r
+            -H "X-Clip-Ledger-Secret: $CLIP_LEDGER_SECRET" -H "Content-Type: application/json" \r
+            -d "{\"repo\":\"$REPO\"}"
+

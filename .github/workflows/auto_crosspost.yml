@@ -1,0 +1,263 @@
+name: MindUnlocked FB/IG autopilot (one short per day)
+
+# Posts one stored MindUnlocked video to Facebook (as a Reel) and Instagram
+# (Reels tab only) each day, working through the backlog and then keeping pace
+# with new uploads.
+#
+# Why it exists: every MindUnlocked video is uploaded to YouTube automatically,
+# but Facebook and Instagram only ever went out when someone tapped an Approve
+# button in Telegram -- so the stored videos piled up unposted.
+#
+# PURELY ADDITIVE. It dispatches the very same crosspost_decision.yml in this
+# repo that the Telegram buttons dispatch, with the same inputs. The Approve /
+# Reject / Schedule / Reel buttons, /fbpost, and the */10 scheduler are all
+# untouched and keep working exactly as before. Nothing here posts anything
+# itself or marks anything posted -- crosspost_decision.yml still owns that.
+#
+# The queue refills itself: _youtube_upload.py POSTs /video/fb-ig-ready after
+# every successful upload, so a new video becomes eligible on its own. No
+# backfill is ever needed and the list only grows.
+#
+# PAUSE IT: commit an empty file named AUTOPILOT_OFF in this repo's root. The
+# next run exits without posting. Delete it to resume.
+#
+# NOTE: this repo's default branch is **master**, not main. A workflow pushed
+# to a stray `main` would never run.
+
+on:
+  schedule:
+    # Deliberately EARLY. GitHub fires scheduled workflows 1.5-2h late and the
+    # delay drifts day to day, so a cron time cannot decide when a post goes
+    # out -- only when we start waiting. The hold step sets the real time.
+    - cron: '0 3 * * *'     # nominal 03:00 UTC; in practice starts ~04:30-05:00 UTC
+  workflow_dispatch:
+    inputs:
+      skip_hold:
+        description: "'true' = post immediately instead of holding until the slot (manual tests)"
+        required: false
+        default: ""
+      dry_run:
+        description: "'true' = pick a video and report it, dispatch nothing"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: mu-auto-crosspost
+  cancel-in-progress: false
+
+env:
+  # 06:00 UTC = 11:30 IST, plus a 0-90 min per-date jitter -> 11:30-13:00 IST.
+  # Deliberately offset from the Shadow Gasp autopilots (09:00 / 14:00 / 20:00
+  # IST) so the two brands never post in the same minute.
+  #
+  # Jitter comes from the date, not $RANDOM, so a re-run of the same day
+  # computes the same target instead of shifting the slot.
+  BASE_AT_UTC: "06:00"
+  WORKER_BASE: https://mindunlocked-bot.everydayhypehq.workers.dev
+
+jobs:
+  crosspost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hold until the slot (11:30-13:00 IST, jittered by date)
+        # Runner minutes are free here, so an idle wait costs nothing and buys
+        # an exact posting time instead of a drifting one. Bounded: if we start
+        # at or past the target, post now rather than sleeping ~24h.
+        if: github.event.inputs.skip_hold != 'true'
+        run: |
+          JITTER=$(( 10#$(date -u +%j) * 41 % 91 ))
+          NOW=$(date -u +%s)
+          TARGET=$(( $(date -u -d "today ${BASE_AT_UTC}" +%s) + JITTER * 60 ))
+          echo "today's slot: $(date -u -d "@$TARGET" +%H:%M) UTC (+${JITTER}m) = $(TZ=Asia/Kolkata date -d "@$TARGET" +%H:%M) IST"
+          WAIT=$(( TARGET - NOW ))
+          if [ "$WAIT" -gt 0 ] && [ "$WAIT" -le 21600 ]; then
+            echo "started $(date -u +%H:%M) UTC -- holding ${WAIT}s"
+            sleep "$WAIT"
+          else
+            echo "started $(date -u +%H:%M) UTC -- at or past the slot, posting now"
+          fi
+
+      - name: Kill switch
+        id: killswitch
+        run: |
+          if [ -f AUTOPILOT_OFF ]; then
+            echo "AUTOPILOT_OFF is present -- standing down."
+            echo "off=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "off=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ask the bot which video is next
+        id: pick
+        if: steps.killswitch.outputs.off != 'true'
+        env:
+          CLIP_LEDGER_SECRET: ${{ secrets.CLIP_LEDGER_SECRET }}
+        run: |
+          # The "still needs FB/IG" list lives in the Worker's KV, not in git,
+          # so it has to be asked for. /autopilot/next is read-only: it picks
+          # nothing, posts nothing and writes nothing.
+          #
+          # A browser User-Agent, because Cloudflare refuses curl/urllib
+          # defaults at the edge with error 1010 -- a 403 the Worker never
+          # sees. That exact bug hid MindUnlocked's crosspost confirmations
+          # for a month.
+          curl -sS -X POST "$WORKER_BASE/autopilot/next" \
+            -H "X-Clip-Ledger-Secret: $CLIP_LEDGER_SECRET" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -o next.json -w "http_status=%{http_code}\n"
+          test -s next.json || { echo "::error::no response from the bot"; exit 1; }
+          python3 - <<'PYEOF' | tee -a "$GITHUB_OUTPUT"
+          # tee, not a bare redirect: this runs unattended, and a log that does
+          # not say which video was chosen is useless the day something looks wrong.
+          import json
+          d = json.load(open("next.json", encoding="utf-8"))
+          n = d.get("next")
+          if not n:
+              print("video_id=")
+              print("reason=nothing left -- every stored video is on (or rejected for) Facebook and Instagram")
+          else:
+              print(f"video_id={n['id']}")
+              print(f"title={n.get('title','')}")
+              print(f"video_url={n.get('download_link','')}")
+              print(f"need_fb={'true' if n.get('need_fb') else 'false'}")
+              print(f"need_ig={'true' if n.get('need_ig') else 'false'}")
+              print(f"remaining={d.get('remaining', 0)}")
+          PYEOF
+
+      - name: Measure the video (Facebook Reels must be 3-90s)
+        id: probe
+        if: steps.killswitch.outputs.off != 'true' && steps.pick.outputs.video_id != '' && steps.pick.outputs.need_fb == 'true'
+        continue-on-error: true
+        env:
+          VIDEO_URL: ${{ steps.pick.outputs.video_url }}
+        run: |
+          # ffmpeg is NOT on the runner image, so ffprobe has to be installed
+          # before it can be used -- without this the measure silently fails and
+          # every video quietly loses the Reel format.
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends -qq ffmpeg
+          # MindUnlocked shorts are <=60s, comfortably inside Facebook's 3-90s
+          # Reel window, but a LONG video would be refused outright -- so
+          # measure rather than assume, and fall back to a normal video.
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO_URL" 2>/dev/null | cut -d. -f1)
+          if [ -z "$DUR" ]; then
+            echo "could not measure the video -- posting as a normal video, not a Reel"
+            echo "as_reel=" >> "$GITHUB_OUTPUT"
+          elif [ "$DUR" -ge 3 ] && [ "$DUR" -le 90 ]; then
+            echo "${DUR}s -- inside the Reel window"
+            echo "as_reel=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${DUR}s -- outside Facebook's 3-90s Reel window, posting as a normal video"
+            echo "as_reel=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post to Facebook
+        if: steps.killswitch.outputs.off != 'true' && steps.pick.outputs.video_id != '' && steps.pick.outputs.need_fb == 'true' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEO_ID: ${{ steps.pick.outputs.video_id }}
+          VIDEO_URL: ${{ steps.pick.outputs.video_url }}
+          AS_REEL: ${{ steps.probe.outputs.as_reel }}
+        run: |
+          gh workflow run crosspost_decision.yml --ref master \
+            -f "video_id=$VIDEO_ID" \
+            -f "platform=fb" \
+            -f "decision=approve" \
+            -f "video_url=$VIDEO_URL" \
+            -f "fb_as_reel=$AS_REEL"
+
+      - name: Stagger
+        # Don't fire both platforms in the same second: it reads as one bot
+        # broadcast, and it keeps the two runs from racing each other's KV write.
+        if: steps.killswitch.outputs.off != 'true' && steps.pick.outputs.video_id != '' && steps.pick.outputs.need_fb == 'true' && steps.pick.outputs.need_ig == 'true' && github.event.inputs.dry_run != 'true'
+        run: sleep 600
+
+      - name: Post to Instagram (Reels tab only, not the grid)
+        if: steps.killswitch.outputs.off != 'true' && steps.pick.outputs.video_id != '' && steps.pick.outputs.need_ig == 'true' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEO_ID: ${{ steps.pick.outputs.video_id }}
+          VIDEO_URL: ${{ steps.pick.outputs.video_url }}
+        run: |
+          gh workflow run crosspost_decision.yml --ref master \
+            -f "video_id=$VIDEO_ID" \
+            -f "platform=ig" \
+            -f "decision=approve" \
+            -f "video_url=$VIDEO_URL" \
+            -f "ig_reels_only=true"
+
+      - name: Tell Telegram what the autopilot did
+        # crosspost_decision.yml reports each post's own outcome via
+        # /video/crosspost-decided. This is the one line saying the autopilot
+        # woke up, what it chose, and how much backlog is left.
+        # success() only -- a failed run is announced by the alert step
+        # below instead, which says what broke rather than reporting a
+        # half-empty pick.
+        if: success()
+        continue-on-error: true
+        env:
+          # Sent straight through the Bot API: both secrets are already in this
+          # repo, and it avoids adding another Worker route just to say a sentence.
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Via env, never substituted into the script -- a video title is free
+          # text and a stray quote would otherwise break the step.
+          OFF: ${{ steps.killswitch.outputs.off }}
+          VIDEO_ID: ${{ steps.pick.outputs.video_id }}
+          TITLE: ${{ steps.pick.outputs.title }}
+          REASON: ${{ steps.pick.outputs.reason }}
+          NEED_FB: ${{ steps.pick.outputs.need_fb }}
+          NEED_IG: ${{ steps.pick.outputs.need_ig }}
+          REMAINING: ${{ steps.pick.outputs.remaining }}
+          AS_REEL: ${{ steps.probe.outputs.as_reel }}
+          DRY: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$OFF" = "true" ]; then
+            TEXT="🤖 MU FB/IG autopilot: paused (AUTOPILOT_OFF is committed). Delete it to resume."
+          elif [ -z "$VIDEO_ID" ]; then
+            TEXT="🤖 MU FB/IG autopilot: $REASON"
+          elif [ "$DRY" = "true" ]; then
+            TEXT="🤖 MU FB/IG autopilot (dry run): would post \"$TITLE\" — fb=$NEED_FB ig=$NEED_IG. $REMAINING video(s) left."
+          else
+            REEL=$([ -n "$AS_REEL" ] && echo "Reel" || echo "video")
+            TEXT="🤖 MU FB/IG autopilot: posting \"$TITLE\" → FB(${REEL})=$NEED_FB · IG(Reels-only)=$NEED_IG. $REMAINING video(s) left."
+          fi
+          # TEXT goes to python through the environment so json.dumps does the
+          # escaping -- titles carry quotes and apostrophes.
+          T="$TEXT" python3 -c 'import json,os;print(json.dumps({"chat_id":os.environ["CHAT"],"text":os.environ["T"]}))' > n.json
+          # Check Telegram's own ok flag, don't just check that curl exited 0.
+          # curl -sS returns 0 on a 403/400 too, so discarding the body would
+          # turn a silently undelivered message into a green step.
+          curl -sS -X POST "https://api.telegram.org/bot$BOT/sendMessage" \
+            -H "Content-Type: application/json" --data @n.json -o tg.json \
+            || echo "WARNING: could not reach Telegram"
+          python3 -c 'import json;d=json.load(open("tg.json"));print("telegram ok, message_id",d["result"]["message_id"]) if d.get("ok") else print("WARNING: telegram refused it:",d)' \
+            2>/dev/null || echo "WARNING: unreadable Telegram response"
+
+      # ---- failure alert (added 2026-09-19) ----
+      # Nobody is watching this run. If the autopilot itself breaks -- the bot
+      # unreachable, the Gumroad CLI down, a dispatch refused -- it has to say
+      # so, or the stream just silently stops and the backlog quietly grows
+      # again. Failures of the actual POST are reported separately by the
+      # workflow that does the posting.
+      - name: Tell Telegram the autopilot FAILED
+        if: failure()
+        continue-on-error: true
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MSG: "🔴 MindUnlocked FB/IG autopilot FAILED before posting. No video went out today; it stays in the queue and retries tomorrow."
+        run: |
+          # Built in python so error text carrying a quote cannot break the
+          # payload, and Telegram's own ok flag is checked -- curl -sS exits 0
+          # on a 403 too, which would turn a lost alert into a green step.
+          T="$MSG Log: $RUN_URL"             python3 -c 'import json,os;print(json.dumps({"chat_id":os.environ["CHAT"],"text":os.environ["T"]}))' > tgfail.json
+          curl -sS -X POST "https://api.telegram.org/bot$BOT/sendMessage"             -H "Content-Type: application/json" --data @tgfail.json -o tgfail_resp.json             || echo "WARNING: could not reach Telegram"
+          python3 -c 'import json;d=json.load(open("tgfail_resp.json"));print("alert delivered, message_id",d["result"]["message_id"]) if d.get("ok") else print("WARNING: telegram refused the alert:",d)'             2>/dev/null || echo "WARNING: unreadable Telegram response"

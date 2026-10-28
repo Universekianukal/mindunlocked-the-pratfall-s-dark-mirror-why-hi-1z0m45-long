@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+node_modules/
+renders/
+_pexels_picked.json
+_clips.json
+chunk*.html
+_timeline.json
+_chunks.json
+transcript.json
+captions.json
+assets/clips/

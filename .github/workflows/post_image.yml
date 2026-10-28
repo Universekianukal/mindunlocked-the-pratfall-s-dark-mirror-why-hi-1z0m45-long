@@ -1,0 +1,72 @@
+name: Photo Post
+
+# Dispatched by the mindunlocked-bot Worker when a photo-post "Post" button is
+# tapped, or by its scheduler when a "Schedule"d photo post comes due. Posts ONE
+# image immediately (Instagram's API cannot schedule -- the Worker does the
+# waiting). Lives here for the same reason crosspost_decision.yml does: this is
+# the one permanent template repo; per-video build repos self-delete.
+#
+# New file, added 2026-09-12. crosspost_decision.yml is untouched.
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "fb or ig"
+        required: true
+      source:
+        description: "yt (the video's YouTube thumbnail) or photo (a photo sent to the bot)"
+        required: true
+      video_id:
+        required: false
+      photo_token:
+        required: false
+      caption:
+        required: false
+      notify_chat_id:
+        required: false
+      label:
+        required: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      WORKER_URL: https://mindunlocked-bot.everydayhypehq.workers.dev
+      WORKER_SECRET_HEADER: X-Clip-Ledger-Secret
+      WORKER_SECRET: ${{ secrets.CLIP_LEDGER_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python deps
+        run: pip install --quiet requests Pillow
+      - name: Post the photo
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          SOURCE: ${{ inputs.source }}
+          VIDEO_ID: ${{ inputs.video_id }}
+          PHOTO_TOKEN: ${{ inputs.photo_token }}
+          CAPTION: ${{ inputs.caption }}
+          NOTIFY_CHAT_ID: ${{ inputs.notify_chat_id }}
+          LABEL: ${{ inputs.label }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FB_PAGE_ID: "1166881726518997"
+          IG_USER_ID: "17841440164198548"
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: python3 _post_image.py
+      - name: Tell Telegram if the script never got to report
+        if: failure()
+        continue-on-error: true
+        env:
+          CHAT: ${{ inputs.notify_chat_id }}
+          PLATFORM: ${{ inputs.platform }}
+          LABEL: ${{ inputs.label }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 -c 'import json,os;print(json.dumps({"ok":False,"platform":os.environ["PLATFORM"],"label":os.environ["LABEL"] or "Photo post","chat_id":os.environ["CHAT"],"run_url":os.environ["RUN_URL"],"error":"the post job failed -- see the run log","fallback":True}))' > /tmp/fail.json
+          curl -sS -X POST "$WORKER_URL/post/decided" \
+            -H "$WORKER_SECRET_HEADER: $WORKER_SECRET" -H "Content-Type: application/json" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --data @/tmp/fail.json || true
